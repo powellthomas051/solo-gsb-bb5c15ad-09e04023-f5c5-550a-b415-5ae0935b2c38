@@ -22,6 +22,9 @@ from .schemas import (
     Loads,
     Phase,
     PhaseFaultRehearsalResult,
+    PowerLogAlertItem,
+    PowerLogReplayRequest,
+    PowerLogReplayResult,
     RobustRehearsalRequest,
     RobustRehearsalResult,
     ShiftAssignmentItem,
@@ -37,6 +40,8 @@ from .solver import (
     AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
+    PowerLogDevice,
+    PowerLogEvent,
     RobustDevice,
     ShiftDevice,
     StartupDevice,
@@ -44,6 +49,7 @@ from .solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
+    solve_power_log_replay,
     solve_robust,
     solve_shift_plan,
     solve_startup_plan,
@@ -87,6 +93,10 @@ _MESSAGE_SHIFT_INFEASIBLE = (
     "无可行方案：不存在每台设备恰选一个允许时段与允许相位、"
     "且各时段各相负载均不超容量的错峰接入方案"
 )
+_MESSAGE_REPLAY_CLEAN = "复盘完成：窗口内各相负载均未超过容量"
+_MESSAGE_REPLAY_ALERT = (
+    "复盘完成：窗口内存在超容区间，已将连续超容段合并为告警"
+)
 
 
 @asynccontextmanager
@@ -120,6 +130,12 @@ app = FastAPI(
         "一个允许时段（早/晚）与一个允许相位，各时段各相负载均不超容量，"
         "先最小化两时段总负载的较大值，再最小化两时段三相负载差的较大值"
         "（仅预演，不持久化）。"
+        "对已有可行分配的计算记录，还可做运行功率日志复盘：提交起止 Unix 秒"
+        "窗口与设备实际功率变更事件（最多 200 条），沿用记录的设备相位与各相"
+        "容量，窗口起点所有设备功率为 0，按时刻批量生效同秒事件并计算事件间"
+        "至窗口终点的三相负载，将连续存在任一相超容的区间合并为告警，返回"
+        "各段告警起止时刻、各相最大超额量与全窗口各相峰值"
+        "（仅复盘，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -686,4 +702,79 @@ def create_shift_plan(payload: ShiftPlanRequest) -> ShiftPlanResult:
         slots=slots,
         assignments=assignments,
         message=_MESSAGE_SHIFT_FEASIBLE if result.feasible else _MESSAGE_SHIFT_INFEASIBLE,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/power-log-replay",
+    response_model=PowerLogReplayResult,
+    tags=["calculations"],
+)
+def power_log_replay(
+    calculation_id: int, payload: PowerLogReplayRequest
+) -> PowerLogReplayResult:
+    """运行功率日志复盘：对已有可行分配的记录回放窗口内的功率变更事件。
+
+    沿用记录中的设备相位与各相容量。窗口起点所有设备功率为 0；同一时刻的
+    事件批量生效，计算事件之间至窗口终点的三相负载，将连续存在任一相超容
+    的区间合并为告警。返回每段告警的起止时刻与各相最大超额量，以及全窗口
+    各相峰值负载。仅做复盘，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；窗口起点不早于终点、
+    事件时刻落在左闭右开窗口之外、同一设备同一时刻重复、事件包含未知设备
+    编号或功率为负均返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法复盘功率日志：id={calculation_id}",
+        )
+
+    record_ids = {d["device_id"] for d in record["devices"]}
+    unknown = sorted({e.device_id for e in payload.events} - record_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"事件包含未知设备编号：{', '.join(unknown)}",
+        )
+
+    devices = [
+        PowerLogDevice(code=d["device_id"], phase=d["assigned_phase"])
+        for d in record["devices"]
+    ]
+    events = [
+        PowerLogEvent(code=e.device_id, timestamp=e.timestamp, power=e.power)
+        for e in payload.events
+    ]
+    result = solve_power_log_replay(
+        devices,
+        record["capacities"],
+        payload.window_start,
+        payload.window_end,
+        events,
+    )
+
+    alerts = [
+        PowerLogAlertItem(
+            start=alert.start,
+            end=alert.end,
+            max_overload=Loads(**alert.max_overload),
+        )
+        for alert in result.alerts
+    ]
+    return PowerLogReplayResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        capacities=Loads(**record["capacities"]),
+        window_start=payload.window_start,
+        window_end=payload.window_end,
+        alerts=alerts,
+        peak_loads=Loads(**result.peak_loads),
+        message=_MESSAGE_REPLAY_ALERT if alerts else _MESSAGE_REPLAY_CLEAN,
     )

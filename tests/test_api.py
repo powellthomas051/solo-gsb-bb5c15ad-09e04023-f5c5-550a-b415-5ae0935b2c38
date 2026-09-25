@@ -1234,3 +1234,267 @@ def test_shift_plan_allowed_values_deduplicated():
     resp = client.post("/api/v1/shift-plans", json=payload)
     assert resp.status_code == 200
     assert resp.json()["feasible"] is True
+
+
+# ---------------------------------------------------------------------------
+# 运行功率日志复盘
+# ---------------------------------------------------------------------------
+
+# 三台设备分别固定接 A/B/C（各 10，容量各 25），便于直接构造各相负载
+REPLAY_BASE_PAYLOAD = {
+    "capacities": {"A": 25, "B": 25, "C": 25},
+    "devices": [
+        {"id": "D1", "power": 10, "allowed_phases": ["A"]},
+        {"id": "D2", "power": 10, "allowed_phases": ["B"]},
+        {"id": "D3", "power": 10, "allowed_phases": ["C"]},
+    ],
+}
+
+
+def _replay_body(events, window_start=1000, window_end=2000):
+    return {
+        "window_start": window_start,
+        "window_end": window_end,
+        "events": events,
+    }
+
+
+def _create_replay_record():
+    created = _create(REPLAY_BASE_PAYLOAD)
+    assert created["feasible"] is True
+    return created["id"]
+
+
+def test_power_log_replay_alerts_and_peaks():
+    calc_id = _create_replay_record()
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 20},
+        {"device_id": "D1", "timestamp": 1200, "power": 30},
+        {"device_id": "D2", "timestamp": 1300, "power": 30},
+        {"device_id": "D1", "timestamp": 1400, "power": 0},
+        {"device_id": "D2", "timestamp": 1500, "power": 10},
+        {"device_id": "D3", "timestamp": 1600, "power": 40},
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == calc_id
+    assert body["capacities"] == {"A": 25, "B": 25, "C": 25}
+    assert body["window_start"] == 1000
+    assert body["window_end"] == 2000
+    assert body["peak_loads"] == {"A": 30, "B": 30, "C": 40}
+    # [1200,1500) 三段连续超容合并；[1600,2000) 超容延伸至窗口终点
+    assert body["alerts"] == [
+        {"start": 1200, "end": 1500,
+         "max_overload": {"A": 5, "B": 5, "C": 0}},
+        {"start": 1600, "end": 2000,
+         "max_overload": {"A": 0, "B": 0, "C": 15}},
+    ]
+    assert "复盘" in body["message"]
+
+
+def test_power_log_replay_same_timestamp_batch():
+    # 同一时刻多台设备的事件批量生效
+    calc_id = _create_replay_record()
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 30},
+        {"device_id": "D2", "timestamp": 1100, "power": 30},
+    ]
+    body = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    ).json()
+    assert body["peak_loads"] == {"A": 30, "B": 30, "C": 0}
+    assert body["alerts"] == [
+        {"start": 1100, "end": 2000,
+         "max_overload": {"A": 5, "B": 5, "C": 0}},
+    ]
+
+
+def test_power_log_replay_uses_record_phases_and_capacities():
+    # 沿用记录中的相位与容量：VALID_PAYLOAD 分配为 D1->A, D2->B, D3->C，
+    # 容量各 100；D3 事件功率 130 使 C 相超额 30
+    created = _create(VALID_PAYLOAD)
+    calc_id = created["id"]
+    events = [
+        {"device_id": "D3", "timestamp": 500, "power": 130},
+        {"device_id": "D1", "timestamp": 600, "power": 90},
+    ]
+    body = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events, window_start=400, window_end=700),
+    ).json()
+    assert body["capacities"] == {"A": 100, "B": 100, "C": 100}
+    assert body["peak_loads"] == {"A": 90, "B": 0, "C": 130}
+    assert body["alerts"] == [
+        {"start": 500, "end": 700,
+         "max_overload": {"A": 0, "B": 0, "C": 30}},
+    ]
+
+
+def test_power_log_replay_no_events():
+    calc_id = _create_replay_record()
+    body = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body([]),
+    ).json()
+    assert body["alerts"] == []
+    assert body["peak_loads"] == {"A": 0, "B": 0, "C": 0}
+    assert "未超过" in body["message"]
+
+
+def test_power_log_replay_event_at_window_start():
+    # 事件时刻等于窗口起点（左闭）：自起点即生效
+    calc_id = _create_replay_record()
+    events = [{"device_id": "D1", "timestamp": 1000, "power": 30}]
+    body = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    ).json()
+    assert body["alerts"] == [
+        {"start": 1000, "end": 2000,
+         "max_overload": {"A": 5, "B": 0, "C": 0}},
+    ]
+
+
+def test_power_log_replay_404():
+    resp = client.post(
+        "/api/v1/calculations/999999/power-log-replay",
+        json=_replay_body([]),
+    )
+    assert resp.status_code == 404
+
+
+def test_power_log_replay_409_when_record_infeasible():
+    created = _create(INFEASIBLE_UPGRADE_PAYLOAD)
+    assert created["feasible"] is False
+    resp = client.post(
+        f"/api/v1/calculations/{created['id']}/power-log-replay",
+        json=_replay_body([]),
+    )
+    assert resp.status_code == 409
+
+
+def test_power_log_replay_422_unknown_device():
+    calc_id = _create_replay_record()
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 5},
+        {"device_id": "GHOST", "timestamp": 1200, "power": 5},
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 422
+    assert "未知设备" in resp.json()["detail"]
+
+
+def test_power_log_replay_422_window_not_ordered():
+    calc_id = _create_replay_record()
+    # 起点等于终点、起点晚于终点均不允许
+    for start, end in ((1000, 1000), (2000, 1000)):
+        resp = client.post(
+            f"/api/v1/calculations/{calc_id}/power-log-replay",
+            json=_replay_body([], window_start=start, window_end=end),
+        )
+        assert resp.status_code == 422
+
+
+def test_power_log_replay_422_event_outside_window():
+    calc_id = _create_replay_record()
+    # 时刻等于窗口终点（右开）与早于窗口起点均不允许
+    for timestamp in (2000, 3000, 999):
+        events = [{"device_id": "D1", "timestamp": timestamp, "power": 5}]
+        resp = client.post(
+            f"/api/v1/calculations/{calc_id}/power-log-replay",
+            json=_replay_body(events),
+        )
+        assert resp.status_code == 422
+
+
+def test_power_log_replay_422_duplicate_device_timestamp():
+    calc_id = _create_replay_record()
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 5},
+        {"device_id": "D1", "timestamp": 1100, "power": 8},
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 422
+    # 不同设备同一时刻允许
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 5},
+        {"device_id": "D2", "timestamp": 1100, "power": 8},
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 200
+
+
+def test_power_log_replay_422_negative_power():
+    calc_id = _create_replay_record()
+    events = [{"device_id": "D1", "timestamp": 1100, "power": -1}]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 422
+
+
+def test_power_log_replay_event_count_limit():
+    calc_id = _create_replay_record()
+    # 200 条为上限，允许
+    events = [
+        {"device_id": "D1", "timestamp": 1000 + i, "power": 1}
+        for i in range(200)
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events, window_start=1000, window_end=1201),
+    )
+    assert resp.status_code == 200
+    # 201 条超出上限
+    events = [
+        {"device_id": "D1", "timestamp": 1000 + i, "power": 1}
+        for i in range(201)
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events, window_start=1000, window_end=1201),
+    )
+    assert resp.status_code == 422
+
+
+def test_power_log_replay_does_not_modify_record():
+    calc_id = _create_replay_record()
+    before = client.get(f"/api/v1/calculations/{calc_id}").json()
+    count_before = len(client.get("/api/v1/calculations").json())
+
+    events = [
+        {"device_id": "D1", "timestamp": 1100, "power": 30},
+        {"device_id": "D2", "timestamp": 1200, "power": 30},
+    ]
+    resp = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    )
+    assert resp.status_code == 200
+
+    # 复盘不改历史：原记录内容与记录总数均不变
+    after = client.get(f"/api/v1/calculations/{calc_id}").json()
+    assert after == before
+    assert len(client.get("/api/v1/calculations").json()) == count_before
+
+    # 再次复盘结果确定且相同（幂等读操作）
+    again = client.post(
+        f"/api/v1/calculations/{calc_id}/power-log-replay",
+        json=_replay_body(events),
+    ).json()
+    assert again == resp.json()

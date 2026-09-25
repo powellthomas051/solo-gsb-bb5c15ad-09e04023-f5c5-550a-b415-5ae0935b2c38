@@ -421,3 +421,81 @@ class ShiftPlanResult(BaseModel):
         ..., description="设备安排（按设备编号排序）；无解时为空"
     )
     message: str
+
+
+class PowerLogEventIn(BaseModel):
+    """单条设备实际功率变更事件。"""
+
+    device_id: str = Field(
+        ..., min_length=1, max_length=64, description="设备编号，须存在于计算记录中"
+    )
+    timestamp: int = Field(
+        ..., description="变更时刻（Unix 秒，须落在左闭右开窗口内）"
+    )
+    power: int = Field(..., ge=0, description="变更后的实际功率（非负整数）")
+
+
+class PowerLogReplayRequest(BaseModel):
+    """运行功率日志复盘请求体（仅复盘，不修改历史计算记录）。"""
+
+    window_start: int = Field(
+        ..., description="窗口起点（Unix 秒，须早于窗口终点）"
+    )
+    window_end: int = Field(..., description="窗口终点（Unix 秒）")
+    events: list[PowerLogEventIn] = Field(
+        ...,
+        max_length=200,
+        description="设备功率变更事件，0~200 条；窗口起点所有设备功率为 0，"
+        "事件时刻须落在左闭右开窗口内，同一设备同一时刻不得重复",
+    )
+
+    @model_validator(mode="after")
+    def _window_ordered(self) -> "PowerLogReplayRequest":
+        if self.window_start >= self.window_end:
+            raise ValueError("窗口起点须早于窗口终点")
+        return self
+
+    @model_validator(mode="after")
+    def _events_in_window_and_unique(self) -> "PowerLogReplayRequest":
+        seen: set[tuple[str, int]] = set()
+        for event in self.events:
+            if not self.window_start <= event.timestamp < self.window_end:
+                raise ValueError(
+                    f"事件时刻须落在左闭右开窗口 "
+                    f"[{self.window_start}, {self.window_end}) 内："
+                    f"设备 {event.device_id} 时刻 {event.timestamp}"
+                )
+            key = (event.device_id, event.timestamp)
+            if key in seen:
+                raise ValueError(
+                    f"同一设备同一时刻不得重复："
+                    f"设备 {event.device_id} 时刻 {event.timestamp}"
+                )
+            seen.add(key)
+        return self
+
+
+class PowerLogAlertItem(BaseModel):
+    """一段超容告警：连续存在任一相超容的合并区间（左闭右开）。"""
+
+    start: int = Field(..., description="告警区间起点（Unix 秒）")
+    end: int = Field(..., description="告警区间终点（Unix 秒）")
+    max_overload: Loads = Field(
+        ...,
+        description="告警区间内各相最大超额量（负载超出容量的最大值，未超容相为 0）",
+    )
+
+
+class PowerLogReplayResult(BaseModel):
+    """运行功率日志复盘结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    window_start: int = Field(..., description="窗口起点（Unix 秒）")
+    window_end: int = Field(..., description="窗口终点（Unix 秒）")
+    alerts: list[PowerLogAlertItem] = Field(
+        ..., description="合并后的超容告警（按起点升序）；无告警时为空"
+    )
+    peak_loads: Loads = Field(..., description="全窗口各相峰值负载")
+    message: str

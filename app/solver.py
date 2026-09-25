@@ -83,6 +83,14 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 放宽容差可换取字典序更小的相位选择。两时段各自最优的相位子序列交错合并
 即 (时段, 相位) 联合序列的字典序最小者：联合序列逐位比较时首个差异位置
 必属某一时段，由该时段子序列的字典序最小性保证不被其他同键方案超越。
+
+运行功率日志复盘（solve_power_log_replay）：对已有可行分配的记录，沿用其
+设备相位与各相容量，回放窗口内的设备实际功率变更日志。窗口起点所有设备
+功率为 0；同一时刻的事件批量生效，段 [t_i, t_{i+1}) 的负载取 t_i 时刻事件
+生效后的功率（t_i 依次为窗口起点与各事件时刻，末段延伸至窗口终点）。任一相
+负载超过容量即超容；相邻超容段合并为一段告警，报告每段告警的起止时刻与
+各相最大超额量，以及全窗口各相峰值负载。事件数不超过 200，按时刻分组后
+一次顺序扫描即可完成。
 """
 
 from __future__ import annotations
@@ -1292,3 +1300,126 @@ def solve_shift_plan(
             max(slot_loads[s].values()) - min(slot_loads[s].values()) for s in SLOTS
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# 运行功率日志复盘
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PowerLogDevice:
+    """功率日志复盘的设备：接入相位固定（沿用原计算记录）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 固定接入相位（A/B/C）
+
+
+@dataclass(frozen=True)
+class PowerLogEvent:
+    """一条设备实际功率变更事件。"""
+
+    code: str  # 设备编号
+    timestamp: int  # 变更时刻（Unix 秒，落在左闭右开窗口内）
+    power: int  # 变更后的实际功率（非负整数）
+
+
+@dataclass(frozen=True)
+class PowerLogAlert:
+    """一段超容告警：连续存在任一相超容的区间合并结果（左闭右开）。"""
+
+    start: int  # 告警区间起点（Unix 秒）
+    end: int  # 告警区间终点（Unix 秒）
+    max_overload: dict[str, int]  # 相位 -> 区间内该相最大超额量（未超容相为 0）
+
+
+@dataclass(frozen=True)
+class PowerLogReplayResult:
+    """运行功率日志复盘结果。"""
+
+    alerts: tuple[PowerLogAlert, ...]  # 合并后的超容告警（按起点升序）
+    peak_loads: dict[str, int]  # 相位 -> 全窗口峰值负载
+
+
+def solve_power_log_replay(
+    devices: Iterable[PowerLogDevice],
+    capacities: dict[str, int],
+    window_start: int,
+    window_end: int,
+    events: Iterable[PowerLogEvent],
+) -> PowerLogReplayResult:
+    """复盘窗口内的设备功率变更日志，汇总超容告警与各相峰值负载。
+
+    窗口起点所有设备功率为 0；同一时刻的事件批量生效，段 [t_i, t_{i+1})
+    的负载取 t_i 时刻事件生效后的功率（t_i 依次为窗口起点与各事件时刻，
+    末段延伸至窗口终点）。任一相负载超过容量即超容；相邻超容段合并为一段
+    告警，给出每段告警的起止时刻与各相最大超额量，以及全窗口各相峰值负载。
+
+    :param devices: 设备集合（编号唯一、相位固定）。
+    :param capacities: 各相容量（沿用记录），形如 {"A": int, "B": int, "C": int}。
+    :param window_start: 窗口起点（Unix 秒，须早于窗口终点）。
+    :param window_end: 窗口终点（Unix 秒）。
+    :param events: 功率变更事件（时刻落在左闭右开窗口内、同一设备同一时刻不重复）。
+    :return: PowerLogReplayResult。
+    """
+    phase_of = {d.code: d.phase for d in devices}
+    caps = {p: capacities[p] for p in PHASES}
+
+    # 同一时刻的事件批量生效：按时刻分组
+    by_time: dict[int, list[PowerLogEvent]] = {}
+    for event in events:
+        by_time.setdefault(event.timestamp, []).append(event)
+
+    # 段边界：窗口起点 -> 各事件时刻 -> 窗口终点
+    # （事件时刻等于窗口起点时不重复计入，起点段直接取事件生效后的功率）
+    boundaries = (
+        [window_start]
+        + [t for t in sorted(by_time) if t != window_start]
+        + [window_end]
+    )
+
+    current = {code: 0 for code in phase_of}
+    peak = {p: 0 for p in PHASES}
+    alerts: list[PowerLogAlert] = []
+    alert_start: Optional[int] = None  # 正在累积的告警区间起点
+    alert_overload = {p: 0 for p in PHASES}  # 正在累积的各相最大超额量
+
+    for i in range(len(boundaries) - 1):
+        t = boundaries[i]
+        for event in by_time.get(t, ()):
+            current[event.code] = event.power
+        loads = {p: 0 for p in PHASES}
+        for code, power in current.items():
+            loads[phase_of[code]] += power
+        for p in PHASES:
+            if loads[p] > peak[p]:
+                peak[p] = loads[p]
+        overload = {p: max(0, loads[p] - caps[p]) for p in PHASES}
+        if any(overload[p] > 0 for p in PHASES):
+            # 超容段：与此前相邻超容段合并（段间首尾相接，区间天然连续）
+            if alert_start is None:
+                alert_start = t
+            for p in PHASES:
+                if overload[p] > alert_overload[p]:
+                    alert_overload[p] = overload[p]
+        elif alert_start is not None:
+            # 本段不再超容：告警区间结束于本段起点
+            alerts.append(
+                PowerLogAlert(
+                    start=alert_start,
+                    end=t,
+                    max_overload=dict(alert_overload),
+                )
+            )
+            alert_start = None
+            alert_overload = {p: 0 for p in PHASES}
+    if alert_start is not None:  # 超容区间一直延伸至窗口终点
+        alerts.append(
+            PowerLogAlert(
+                start=alert_start,
+                end=window_end,
+                max_overload=dict(alert_overload),
+            )
+        )
+
+    return PowerLogReplayResult(alerts=tuple(alerts), peak_loads=peak)

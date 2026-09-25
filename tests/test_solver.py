@@ -9,6 +9,8 @@ from app.solver import (
     AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
+    PowerLogDevice,
+    PowerLogEvent,
     RobustDevice,
     ShiftDevice,
     StartupDevice,
@@ -16,6 +18,7 @@ from app.solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
+    solve_power_log_replay,
     solve_robust,
     solve_shift_plan,
     solve_startup_plan,
@@ -1766,6 +1769,221 @@ class ShiftPlanFuzzTest(unittest.TestCase):
             )
             self.assertEqual(
                 tuple(result.assignment[d.code] for d in ordered), expected[1]
+            )
+
+
+# ---------------------------------------------------------------------------
+# 运行功率日志复盘
+# ---------------------------------------------------------------------------
+
+
+def brute_force_replay(devices, capacities, window_start, window_end, events):
+    """朴素参照实现：每段独立从头重放全部事件计算负载，再合并超容段。
+
+    返回 (alerts, peak)：alerts 为 (start, end, max_overload) 三元组列表。
+    """
+    phase_of = {d.code: d.phase for d in devices}
+    ordered_events = sorted(events, key=lambda e: e.timestamp)
+    points = sorted({window_start, window_end} | {e.timestamp for e in events})
+    peak = {p: 0 for p in PHASES}
+    alerts = []
+    open_alert = None
+    for i in range(len(points) - 1):
+        t = points[i]
+        current = {code: 0 for code in phase_of}
+        for event in ordered_events:
+            if event.timestamp > t:
+                break
+            current[event.code] = event.power
+        loads = {p: 0 for p in PHASES}
+        for code, power in current.items():
+            loads[phase_of[code]] += power
+        for p in PHASES:
+            peak[p] = max(peak[p], loads[p])
+        overload = {p: max(0, loads[p] - capacities[p]) for p in PHASES}
+        if any(v > 0 for v in overload.values()):
+            if open_alert is None:
+                open_alert = [t, points[i + 1], overload]
+            else:
+                open_alert[1] = points[i + 1]
+                open_alert[2] = {
+                    p: max(open_alert[2][p], overload[p]) for p in PHASES
+                }
+        elif open_alert is not None:
+            alerts.append(tuple(open_alert))
+            open_alert = None
+    if open_alert is not None:
+        alerts.append(tuple(open_alert))
+    return alerts, peak
+
+
+class PowerLogReplayTest(unittest.TestCase):
+    DEVICES = [
+        PowerLogDevice("D1", "A"),
+        PowerLogDevice("D2", "B"),
+        PowerLogDevice("D3", "C"),
+    ]
+    CAPS = {"A": 25, "B": 25, "C": 25}
+
+    def test_alerts_merged_and_peaks(self):
+        events = [
+            PowerLogEvent("D1", 1100, 20),
+            PowerLogEvent("D1", 1200, 30),
+            PowerLogEvent("D2", 1300, 30),
+            PowerLogEvent("D1", 1400, 0),
+            PowerLogEvent("D2", 1500, 10),
+            PowerLogEvent("D3", 1600, 40),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(result.peak_loads, {"A": 30, "B": 30, "C": 40})
+        self.assertEqual(len(result.alerts), 2)
+        # [1200,1500) 三段连续超容合并：A 最大超额 5、B 最大超额 5
+        self.assertEqual((result.alerts[0].start, result.alerts[0].end), (1200, 1500))
+        self.assertEqual(
+            result.alerts[0].max_overload, {"A": 5, "B": 5, "C": 0}
+        )
+        # [1600,2000) 超容延伸至窗口终点
+        self.assertEqual((result.alerts[1].start, result.alerts[1].end), (1600, 2000))
+        self.assertEqual(
+            result.alerts[1].max_overload, {"A": 0, "B": 0, "C": 15}
+        )
+
+    def test_same_timestamp_events_apply_together(self):
+        # 同一时刻两台设备的事件批量生效：段内两相同时计入
+        events = [
+            PowerLogEvent("D1", 1100, 30),
+            PowerLogEvent("D2", 1100, 30),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(result.peak_loads, {"A": 30, "B": 30, "C": 0})
+        self.assertEqual(len(result.alerts), 1)
+        self.assertEqual(
+            (result.alerts[0].start, result.alerts[0].end), (1100, 2000)
+        )
+        self.assertEqual(
+            result.alerts[0].max_overload, {"A": 5, "B": 5, "C": 0}
+        )
+
+    def test_event_at_window_start(self):
+        # 事件时刻等于窗口起点：自窗口起点即生效
+        events = [PowerLogEvent("D1", 1000, 30)]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(len(result.alerts), 1)
+        self.assertEqual(
+            (result.alerts[0].start, result.alerts[0].end), (1000, 2000)
+        )
+
+    def test_no_events(self):
+        result = solve_power_log_replay(self.DEVICES, self.CAPS, 1000, 2000, [])
+        self.assertEqual(result.alerts, ())
+        self.assertEqual(result.peak_loads, {"A": 0, "B": 0, "C": 0})
+
+    def test_no_overload_no_alert(self):
+        events = [
+            PowerLogEvent("D1", 1100, 25),  # 恰好等于容量，不超容
+            PowerLogEvent("D2", 1200, 10),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(result.alerts, ())
+        self.assertEqual(result.peak_loads, {"A": 25, "B": 10, "C": 0})
+
+    def test_separate_overload_segments_not_merged(self):
+        # 两段超容之间隔着正常段：不合并
+        events = [
+            PowerLogEvent("D1", 1100, 30),
+            PowerLogEvent("D1", 1200, 10),
+            PowerLogEvent("D1", 1300, 40),
+            PowerLogEvent("D1", 1400, 0),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(
+            [(a.start, a.end) for a in result.alerts],
+            [(1100, 1200), (1300, 1400)],
+        )
+        self.assertEqual(result.alerts[0].max_overload["A"], 5)
+        self.assertEqual(result.alerts[1].max_overload["A"], 15)
+
+    def test_zero_power_event_turns_device_off(self):
+        # 功率 0 事件即设备关停，超容区间随之结束
+        events = [
+            PowerLogEvent("D1", 1100, 30),
+            PowerLogEvent("D1", 1200, 0),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(
+            [(a.start, a.end) for a in result.alerts], [(1100, 1200)]
+        )
+        self.assertEqual(result.peak_loads, {"A": 30, "B": 0, "C": 0})
+
+    def test_unordered_events_input(self):
+        # 事件无需按时刻顺序给出
+        events = [
+            PowerLogEvent("D3", 1600, 40),
+            PowerLogEvent("D1", 1100, 30),
+            PowerLogEvent("D2", 1300, 30),
+        ]
+        result = solve_power_log_replay(
+            self.DEVICES, self.CAPS, 1000, 2000, events
+        )
+        self.assertEqual(
+            [(a.start, a.end) for a in result.alerts], [(1100, 2000)]
+        )
+        self.assertEqual(
+            result.alerts[0].max_overload, {"A": 5, "B": 5, "C": 15}
+        )
+
+
+class PowerLogReplayFuzzTest(unittest.TestCase):
+    """复盘求解与朴素逐段重放参照实现做随机对拍。"""
+
+    def test_against_brute_force(self):
+        rng = random.Random(20260925)
+        for case in range(500):
+            n = rng.randint(1, 6)
+            devices = [
+                PowerLogDevice(f"DEV-{i}", rng.choice(PHASES)) for i in range(n)
+            ]
+            capacities = {p: rng.randint(0, 40) for p in PHASES}
+            window_start = rng.randint(0, 100)
+            window_end = window_start + rng.randint(1, 500)
+            m = rng.randint(0, 40)
+            used = set()
+            events = []
+            for _ in range(m):
+                for _ in range(20):  # 生成互不相同的 (设备, 时刻)
+                    code = rng.choice([d.code for d in devices])
+                    t = rng.randrange(window_start, window_end)
+                    if (code, t) not in used:
+                        used.add((code, t))
+                        events.append(PowerLogEvent(code, t, rng.randint(0, 60)))
+                        break
+
+            expected_alerts, expected_peak = brute_force_replay(
+                devices, capacities, window_start, window_end, events
+            )
+            result = solve_power_log_replay(
+                devices, capacities, window_start, window_end, events
+            )
+            self.assertEqual(
+                result.peak_loads, expected_peak, f"case {case}: 峰值不符"
+            )
+            actual_alerts = [
+                (a.start, a.end, a.max_overload) for a in result.alerts
+            ]
+            self.assertEqual(
+                actual_alerts, expected_alerts, f"case {case}: 告警不符"
             )
 
 
