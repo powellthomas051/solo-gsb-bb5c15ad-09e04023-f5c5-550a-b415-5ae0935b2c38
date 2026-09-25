@@ -421,3 +421,72 @@ class ShiftPlanResult(BaseModel):
         ..., description="设备安排（按设备编号排序）；无解时为空"
     )
     message: str
+
+
+class PowerChangeEventIn(BaseModel):
+    """一条设备实际功率变更事件。"""
+
+    device_id: str = Field(
+        ..., min_length=1, max_length=64, description="设备编号，须属于复盘记录"
+    )
+    timestamp: int = Field(..., description="事件时刻（Unix 秒，须落在复盘窗口内）")
+    power: int = Field(..., ge=0, description="变更后的实际功率（非负整数）")
+
+
+class PowerReplayRequest(BaseModel):
+    """运行功率日志复盘请求体（只读，不修改历史计算记录）。"""
+
+    start: int = Field(..., description="复盘窗口起点（Unix 秒，须早于终点）")
+    end: int = Field(..., description="复盘窗口终点（Unix 秒，左闭右开）")
+    events: list[PowerChangeEventIn] = Field(
+        ...,
+        max_length=200,
+        description="设备实际功率变更事件，至多 200 条；"
+        "时刻须落在 [start, end) 内，同一设备同一时刻不得重复",
+    )
+
+    @model_validator(mode="after")
+    def _validate_window_and_events(self) -> "PowerReplayRequest":
+        if self.start >= self.end:
+            raise ValueError("窗口起点须早于终点（start < end）")
+        seen: set[tuple[str, int]] = set()
+        for event in self.events:
+            if not (self.start <= event.timestamp < self.end):
+                raise ValueError(
+                    f"事件时刻须落在左闭右开窗口 [{self.start}, {self.end}) 内："
+                    f"设备 {event.device_id} 时刻 {event.timestamp}"
+                )
+            key = (event.device_id, event.timestamp)
+            if key in seen:
+                raise ValueError(
+                    "同一设备同一时刻不得存在重复事件："
+                    f"设备 {event.device_id} 时刻 {event.timestamp}"
+                )
+            seen.add(key)
+        return self
+
+
+class OverloadSegmentItem(BaseModel):
+    """一段连续超容告警（相邻超容区间合并而成）。"""
+
+    start: int = Field(..., description="告警起始时刻（Unix 秒，含）")
+    end: int = Field(..., description="告警结束时刻（Unix 秒，不含）")
+    max_excess: Loads = Field(..., description="段内各相最大超额量（负载超出容量部分）")
+
+
+class PowerReplayResult(BaseModel):
+    """运行功率日志复盘结果（原计算记录不做任何修改）。"""
+
+    id: int
+    created_at: str
+    capacities: Loads = Field(..., description="各相容量（沿用原计算记录）")
+    window_start: int = Field(..., description="复盘窗口起点（Unix 秒，回显请求输入）")
+    window_end: int = Field(..., description="复盘窗口终点（Unix 秒，回显请求输入）")
+    assignments: list[AssignmentItem] = Field(
+        ..., description="复盘沿用的设备相位（按设备编号排序）"
+    )
+    overload_segments: list[OverloadSegmentItem] = Field(
+        ..., description="连续超容告警段（按起止时刻排序）；无告警时为空"
+    )
+    peak_loads: Loads = Field(..., description="全窗口各相峰值负载")
+    message: str

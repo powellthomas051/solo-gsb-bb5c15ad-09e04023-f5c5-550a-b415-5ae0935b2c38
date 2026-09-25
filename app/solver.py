@@ -83,6 +83,18 @@ A/B/C 展开，完整方案按相位序列字典序依次产生；目标键为 (
 放宽容差可换取字典序更小的相位选择。两时段各自最优的相位子序列交错合并
 即 (时段, 相位) 联合序列的字典序最小者：联合序列逐位比较时首个差异位置
 必属某一时段，由该时段子序列的字典序最小性保证不被其他同键方案超越。
+全部计算为精确枚举，8 台设备的最坏情形亦在秒级内完成。
+
+运行功率日志复盘（solve_power_replay）：对一条已有可行分配的记录，沿用其
+设备相位与各相容量，给定 [start, end) 复盘窗口及至多 200 条设备实际功率
+变更事件（设备、Unix 秒时刻、非负整数功率）。窗口起点所有设备功率为 0；
+同一时刻的事件批量生效，故只需在「事件时刻 + 窗口始终点」划分出的各
+常值区间上各计算一次三相负载：区间 [t_i, t_{i+1}) 的负载为 t_i 时刻批量
+生效后的负载。逐区间判定各相超额量 max(0, 负载 - 容量)，任一相超额即为
+超容区间；相邻（仅被事件时刻隔开的）超容区间合并为一段告警，段内记录
+各相最大超额量，告警段在首个非超容区间起点（或窗口终点）结束。全窗口
+各相峰值负载取所有区间（含起点零功率瞬间）的最大负载。复盘为只读计算，
+不涉及任何优化与持久化。
 """
 
 from __future__ import annotations
@@ -1291,4 +1303,135 @@ def solve_shift_plan(
         peak_imbalance=max(
             max(slot_loads[s].values()) - min(slot_loads[s].values()) for s in SLOTS
         ),
+    )
+
+# ---------------------------------------------------------------------------
+# 运行功率日志复盘
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PowerReplayDevice:
+    """运行功率复盘的设备：接入相位固定（沿用原计算记录）。"""
+
+    code: str  # 设备唯一编号
+    phase: str  # 固定接入相位（A/B/C）
+
+
+@dataclass(frozen=True)
+class PowerChangeEvent:
+    """一条设备实际功率变更事件。"""
+
+    code: str  # 设备编号（须属于复盘记录）
+    timestamp: int  # 事件时刻（Unix 秒，落在复盘窗口 [start, end) 内）
+    power: int  # 变更后功率（非负整数）
+
+
+@dataclass(frozen=True)
+class OverloadSegment:
+    """一段连续超容告警（相邻超容区间合并而成）。"""
+
+    start: int  # 告警起始时刻（首个超容区间起点，Unix 秒）
+    end: int  # 告警结束时刻（首个非超容区间起点 / 窗口终点，Unix 秒）
+    max_excess: dict[str, int]  # 段内各相最大超额量 max(0, 负载 - 容量)
+
+
+@dataclass(frozen=True)
+class PowerReplayResult:
+    """运行功率日志复盘结果（只读计算，不修改任何记录）。"""
+
+    window_start: int  # 复盘窗口起点（Unix 秒）
+    window_end: int  # 复盘窗口终点（Unix 秒）
+    overload_segments: tuple[OverloadSegment, ...]  # 连续超容告警段（按起止排序）
+    peak_loads: dict[str, int]  # 全窗口各相峰值负载
+
+
+def solve_power_replay(
+    devices: Iterable[PowerReplayDevice],
+    capacities: dict[str, int],
+    window_start: int,
+    window_end: int,
+    events: Iterable[PowerChangeEvent],
+) -> PowerReplayResult:
+    """复盘窗口内的设备实际功率，合并连续超容区间并统计全窗口峰值。
+
+    窗口起点所有设备功率为 0；同一时刻的事件批量生效（顺序无关）。负载只
+    在事件时刻之间为常值，故按「事件时刻 + 窗口终点」将 [start, end) 切为
+    若干左闭右开区间，逐区间计算三相负载与各相超额量。任一相超额的区间
+    视为超容区间，相邻超容区间（仅被事件时刻隔开）合并为一段告警：告警段
+    起始于首个超容区间起点，结束于其后首个非超容区间起点（无则窗口终点），
+    段内各相最大超额量为各区间超额量逐相最大值。全窗口各相峰值负载取所有
+    区间（含起点零功率瞬间）的逐相最大值。
+
+    :param devices: 复盘设备集合（编号唯一、相位固定）。
+    :param capacities: 各相容量，形如 {"A": int, "B": int, "C": int}。
+    :param window_start: 复盘窗口起点（Unix 秒，早于终点）。
+    :param window_end: 复盘窗口终点（Unix 秒）。
+    :param events: 功率变更事件（设备须属于 devices；同一设备同一时刻至多一条）。
+    :return: PowerReplayResult。
+    """
+    phase_of = {d.code: d.phase for d in devices}
+    caps = {p: capacities[p] for p in PHASES}
+
+    # 按时刻分组；同一时刻各设备至多一条事件，故批量生效与顺序无关
+    by_time: dict[int, dict[str, int]] = {}
+    for event in events:
+        by_time.setdefault(event.timestamp, {})[event.code] = event.power
+
+    current = {code: 0 for code in phase_of}
+    loads = {p: 0 for p in PHASES}
+    peak_loads = {p: 0 for p in PHASES}
+
+    # points 已去重；窗口起点在批量生效前功率恒为 0，区间评估只需遍历事件
+    # 时刻 t，取 [t, 下一时刻)（最后一个时刻到窗口终点）。
+    points = sorted(by_time)
+    segments: list[OverloadSegment] = []
+    seg_start: Optional[int] = None
+    seg_max_excess = {p: 0 for p in PHASES}
+
+    def close_segment(end: int) -> None:
+        """在 end 时刻闭合当前告警段。"""
+        nonlocal seg_start
+        if seg_start is not None:
+            segments.append(
+                OverloadSegment(
+                    start=seg_start,
+                    end=end,
+                    max_excess=dict(seg_max_excess),
+                )
+            )
+            seg_start = None
+            for p in PHASES:
+                seg_max_excess[p] = 0
+
+    for index, t in enumerate(points):
+        interval_end = points[index + 1] if index + 1 < len(points) else window_end
+        for code, power in by_time[t].items():
+            phase = phase_of[code]
+            loads[phase] += power - current[code]
+            current[code] = power
+
+        excess = {p: max(0, loads[p] - caps[p]) for p in PHASES}
+        for p in PHASES:
+            if loads[p] > peak_loads[p]:
+                peak_loads[p] = loads[p]
+
+        overloaded = any(excess[p] > 0 for p in PHASES)
+        if overloaded:
+            if seg_start is None:
+                seg_start = t
+            for p in PHASES:
+                if excess[p] > seg_max_excess[p]:
+                    seg_max_excess[p] = excess[p]
+        else:
+            # 该区间 [t, interval_end) 不超容：此前若有告警，在 t 处闭合
+            close_segment(t)
+
+    close_segment(window_end)
+
+    return PowerReplayResult(
+        window_start=window_start,
+        window_end=window_end,
+        overload_segments=tuple(segments),
+        peak_loads=peak_loads,
     )

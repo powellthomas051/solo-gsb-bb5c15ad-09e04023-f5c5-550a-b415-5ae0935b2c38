@@ -9,6 +9,8 @@ from app.solver import (
     AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
+    PowerChangeEvent,
+    PowerReplayDevice,
     RobustDevice,
     ShiftDevice,
     StartupDevice,
@@ -16,6 +18,7 @@ from app.solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
+    solve_power_replay,
     solve_robust,
     solve_shift_plan,
     solve_startup_plan,
@@ -1767,6 +1770,185 @@ class ShiftPlanFuzzTest(unittest.TestCase):
             self.assertEqual(
                 tuple(result.assignment[d.code] for d in ordered), expected[1]
             )
+
+
+def _replay_reference(devices, capacities, start, end, events):
+    """逐秒扫描的朴素参照实现，返回 (告警段列表, 各相峰值)。"""
+    phase_of = {d.code: d.phase for d in devices}
+    by_second = {}
+    for event in events:
+        by_second.setdefault(event.timestamp, {})[event.code] = event.power
+    current = {code: 0 for code in phase_of}
+    segments = []
+    peaks = {p: 0 for p in PHASES}
+    seg_start = None
+    seg_excess = {p: 0 for p in PHASES}
+    for t in range(start, end):
+        for code, power in by_second.get(t, {}).items():
+            current[code] = power
+        loads = {p: 0 for p in PHASES}
+        for code, power in current.items():
+            loads[phase_of[code]] += power
+        for p in PHASES:
+            peaks[p] = max(peaks[p], loads[p])
+        excess = {p: max(0, loads[p] - capacities[p]) for p in PHASES}
+        if any(excess[p] > 0 for p in PHASES):
+            if seg_start is None:
+                seg_start = t
+                seg_excess = {p: 0 for p in PHASES}
+            for p in PHASES:
+                seg_excess[p] = max(seg_excess[p], excess[p])
+        elif seg_start is not None:
+            segments.append((seg_start, t, dict(seg_excess)))
+            seg_start = None
+    if seg_start is not None:
+        segments.append((seg_start, end, dict(seg_excess)))
+    return segments, peaks
+
+
+class PowerReplayTest(unittest.TestCase):
+    def setUp(self):
+        self.devices = [
+            PowerReplayDevice("D1", "A"),
+            PowerReplayDevice("D2", "A"),
+            PowerReplayDevice("D3", "B"),
+        ]
+        self.caps = {"A": 10, "B": 5, "C": 100}
+
+    def _run(self, start, end, events):
+        return solve_power_replay(
+            self.devices, self.caps, start, end, events
+        )
+
+    def test_no_events_all_zero(self):
+        result = self._run(100, 200, [])
+        self.assertEqual(result.window_start, 100)
+        self.assertEqual(result.window_end, 200)
+        self.assertEqual(result.overload_segments, ())
+        self.assertEqual(result.peak_loads, {"A": 0, "B": 0, "C": 0})
+
+    def test_overload_until_window_end(self):
+        result = self._run(0, 10, [PowerChangeEvent("D1", 9, 12)])
+        self.assertEqual(len(result.overload_segments), 1)
+        seg = result.overload_segments[0]
+        self.assertEqual((seg.start, seg.end), (9, 10))
+        self.assertEqual(seg.max_excess, {"A": 2, "B": 0, "C": 0})
+        self.assertEqual(result.peak_loads, {"A": 12, "B": 0, "C": 0})
+
+    def test_same_second_events_apply_in_batch(self):
+        # 同秒两设备事件批量生效：A 相 50+60=110
+        result = self._run(0, 10, [
+            PowerChangeEvent("D2", 5, 60),
+            PowerChangeEvent("D1", 5, 50),
+            PowerChangeEvent("D1", 8, 0),
+            PowerChangeEvent("D2", 8, 0),
+        ])
+        self.assertEqual(len(result.overload_segments), 1)
+        seg = result.overload_segments[0]
+        self.assertEqual((seg.start, seg.end), (5, 8))
+        self.assertEqual(seg.max_excess, {"A": 100, "B": 0, "C": 0})
+        self.assertEqual(result.peak_loads, {"A": 110, "B": 0, "C": 0})
+
+    def test_adjacent_overloaded_intervals_merged(self):
+        # [100,130) 连续超容（中间 120 秒事件不解除超容），130 解除；
+        # 150 再次超容至 180。
+        events = [
+            PowerChangeEvent("D1", 100, 8),
+            PowerChangeEvent("D2", 100, 4),
+            PowerChangeEvent("D3", 120, 5),
+            PowerChangeEvent("D1", 130, 3),
+            PowerChangeEvent("D1", 150, 7),
+            PowerChangeEvent("D2", 180, 0),
+        ]
+        result = self._run(100, 200, events)
+        segments = [
+            (s.start, s.end, s.max_excess) for s in result.overload_segments
+        ]
+        self.assertEqual(segments, [
+            (100, 130, {"A": 2, "B": 0, "C": 0}),
+            (150, 180, {"A": 1, "B": 0, "C": 0}),
+        ])
+        self.assertEqual(result.peak_loads, {"A": 12, "B": 5, "C": 0})
+
+    def test_segment_max_excess_per_phase(self):
+        # 合并段内 A、B 两相分别在不同秒达到各自最大超额量（B 容量 4）
+        caps = {"A": 10, "B": 4, "C": 100}
+        events = [
+            PowerChangeEvent("D1", 1, 11),   # A 超 1
+            PowerChangeEvent("D3", 2, 5),    # B 超 1
+            PowerChangeEvent("D2", 3, 1),    # A 超 2
+            PowerChangeEvent("D1", 4, 0),
+            PowerChangeEvent("D2", 4, 0),
+            PowerChangeEvent("D3", 4, 0),
+        ]
+        result = solve_power_replay(self.devices, caps, 0, 20, events)
+        self.assertEqual(len(result.overload_segments), 1)
+        seg = result.overload_segments[0]
+        self.assertEqual((seg.start, seg.end), (1, 4))
+        self.assertEqual(seg.max_excess, {"A": 2, "B": 1, "C": 0})
+        self.assertEqual(result.peak_loads, {"A": 12, "B": 5, "C": 0})
+
+    def test_negative_unload_releases_overload(self):
+        # 功率下调（事件可为任意非负功率）应正确解除超额
+        result = self._run(0, 10, [
+            PowerChangeEvent("D1", 2, 15),
+            PowerChangeEvent("D1", 5, 10),
+        ])
+        seg = result.overload_segments[0]
+        self.assertEqual((seg.start, seg.end), (2, 5))
+        self.assertEqual(seg.max_excess["A"], 5)
+        self.assertEqual(result.peak_loads["A"], 15)
+
+    def test_zero_power_event_is_allowed(self):
+        result = self._run(0, 10, [
+            PowerChangeEvent("D1", 1, 11),
+            PowerChangeEvent("D1", 4, 0),
+        ])
+        self.assertEqual(
+            (result.overload_segments[0].start, result.overload_segments[0].end),
+            (1, 4),
+        )
+
+    def test_peak_uses_max_not_final(self):
+        result = self._run(0, 10, [
+            PowerChangeEvent("D1", 1, 12),
+            PowerChangeEvent("D1", 2, 3),
+        ])
+        self.assertEqual(result.peak_loads, {"A": 12, "B": 0, "C": 0})
+
+
+class PowerReplayFuzzTest(unittest.TestCase):
+    def test_matches_second_by_second_reference(self):
+        rng = random.Random(20260925)
+        codes = ["D1", "D2", "D3", "D4"]
+        phase_choices = ["A", "A", "B", "C"]
+        devices = [
+            PowerReplayDevice(code, phase)
+            for code, phase in zip(codes, phase_choices)
+        ]
+        for _ in range(300):
+            caps = {p: rng.randint(0, 12) for p in PHASES}
+            start = rng.randint(0, 5)
+            end = start + rng.randint(1, 12)
+            events = []
+            used = set()
+            for code in codes:
+                for t in range(start, end):
+                    if rng.random() < 0.25 and (code, t) not in used:
+                        events.append(
+                            PowerChangeEvent(code, t, rng.randint(0, 8))
+                        )
+                        used.add((code, t))
+            rng.shuffle(events)
+            result = solve_power_replay(devices, caps, start, end, events)
+            ref_segments, ref_peaks = _replay_reference(
+                devices, caps, start, end, events
+            )
+            self.assertEqual(
+                [(s.start, s.end, s.max_excess) for s in result.overload_segments],
+                ref_segments,
+            )
+            self.assertEqual(result.peak_loads, ref_peaks)
 
 
 if __name__ == "__main__":

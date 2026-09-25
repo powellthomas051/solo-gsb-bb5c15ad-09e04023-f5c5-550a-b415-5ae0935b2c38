@@ -20,8 +20,11 @@ from .schemas import (
     FaultDisconnectedItem,
     FaultMigrationItem,
     Loads,
+    OverloadSegmentItem,
     Phase,
     PhaseFaultRehearsalResult,
+    PowerReplayRequest,
+    PowerReplayResult,
     RobustRehearsalRequest,
     RobustRehearsalResult,
     ShiftAssignmentItem,
@@ -37,6 +40,8 @@ from .solver import (
     AdditionExistingDevice,
     Device,
     FaultRehearsalDevice,
+    PowerChangeEvent,
+    PowerReplayDevice,
     RobustDevice,
     ShiftDevice,
     StartupDevice,
@@ -44,6 +49,7 @@ from .solver import (
     solve_capacity_upgrade,
     solve_device_addition,
     solve_phase_fault_rehearsal,
+    solve_power_replay,
     solve_robust,
     solve_shift_plan,
     solve_startup_plan,
@@ -87,6 +93,10 @@ _MESSAGE_SHIFT_INFEASIBLE = (
     "无可行方案：不存在每台设备恰选一个允许时段与允许相位、"
     "且各时段各相负载均不超容量的错峰接入方案"
 )
+_MESSAGE_POWER_REPLAY = (
+    "复盘完成：已按记录中的固定相位与容量重放设备实际功率变更事件，"
+    "给出连续超容告警段与全窗口各相峰值负载（原记录未修改）"
+)
 
 
 @asynccontextmanager
@@ -120,6 +130,10 @@ app = FastAPI(
         "一个允许时段（早/晚）与一个允许相位，各时段各相负载均不超容量，"
         "先最小化两时段总负载的较大值，再最小化两时段三相负载差的较大值"
         "（仅预演，不持久化）。"
+        "对已有可行分配的计算记录，还可做运行功率日志复盘：沿用记录中的"
+        "设备相位与各相容量，按 Unix 秒窗口与至多 200 条设备实际功率变更"
+        "事件重放负载，合并连续超容区间为告警段，并给出全窗口各相峰值"
+        "（只读，不修改历史记录）。"
     ),
     version="1.0.0",
     lifespan=lifespan,
@@ -686,4 +700,87 @@ def create_shift_plan(payload: ShiftPlanRequest) -> ShiftPlanResult:
         slots=slots,
         assignments=assignments,
         message=_MESSAGE_SHIFT_FEASIBLE if result.feasible else _MESSAGE_SHIFT_INFEASIBLE,
+    )
+
+
+@app.post(
+    "/api/v1/calculations/{calculation_id}/power-replay",
+    response_model=PowerReplayResult,
+    tags=["calculations"],
+)
+def power_replay(
+    calculation_id: int, payload: PowerReplayRequest
+) -> PowerReplayResult:
+    """运行功率日志复盘：沿用记录的设备相位与容量重放实际功率变更事件。
+
+    给定起止 Unix 秒（起点早于终点，左闭右开）及至多 200 条设备实际功率
+    变更事件（设备编号、时刻、非负整数功率）。窗口起点所有设备功率为 0；
+    事件时刻须落在 [start, end) 内，同一设备同一时刻不得重复。同一时刻的
+    事件批量生效，服务计算各事件间至窗口终点的三相负载，将连续存在任一相
+    超容的区间合并为告警段，返回每段起止时刻、段内各相最大超额量以及全
+    窗口各相峰值负载。复盘只读，不修改历史计算记录。
+
+    记录不存在返回 404；原记录无可行分配返回 409；窗口起止不合法、事件
+    时刻越界、同设备同时刻重复、事件涉及未知设备或事件超过 200 条返回 422。
+    """
+    record = db.get_calculation(calculation_id)
+    if record is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"计算记录不存在：id={calculation_id}",
+        )
+    if not record["feasible"]:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"计算记录无可行分配，无法进行运行功率日志复盘：id={calculation_id}",
+        )
+
+    record_ids = {d["device_id"] for d in record["devices"]}
+    unknown = sorted({e.device_id for e in payload.events} - record_ids)
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"事件涉及不属于该计算记录的未知设备：{', '.join(unknown)}",
+        )
+
+    devices = [
+        PowerReplayDevice(code=d["device_id"], phase=d["assigned_phase"])
+        for d in record["devices"]
+    ]
+    events = [
+        PowerChangeEvent(
+            code=e.device_id, timestamp=e.timestamp, power=e.power
+        )
+        for e in payload.events
+    ]
+    result = solve_power_replay(
+        devices,
+        record["capacities"],
+        window_start=payload.start,
+        window_end=payload.end,
+        events=events,
+    )
+
+    assignments = [
+        AssignmentItem(device_id=d["device_id"], phase=d["assigned_phase"])
+        for d in record["devices"]
+    ]
+    segments = [
+        OverloadSegmentItem(
+            start=segment.start,
+            end=segment.end,
+            max_excess=Loads(**segment.max_excess),
+        )
+        for segment in result.overload_segments
+    ]
+    return PowerReplayResult(
+        id=record["id"],
+        created_at=record["created_at"],
+        capacities=Loads(**record["capacities"]),
+        window_start=result.window_start,
+        window_end=result.window_end,
+        assignments=assignments,
+        overload_segments=segments,
+        peak_loads=Loads(**result.peak_loads),
+        message=_MESSAGE_POWER_REPLAY,
     )
